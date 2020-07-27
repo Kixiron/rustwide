@@ -60,6 +60,7 @@ impl<'a> BuildBuilder<'a> {
             uri: uri.into(),
             branch: branch.into(),
         });
+
         self
     }
 
@@ -86,9 +87,10 @@ impl<'a> BuildBuilder<'a> {
     /// })?;
     /// # Ok(())
     /// # }
-    pub fn run<R, F: FnOnce(&Build) -> Result<R, Error>>(self, f: F) -> Result<R, Error> {
+    pub async fn run<R, F: FnOnce(&Build) -> Result<R, Error>>(self, f: F) -> Result<R, Error> {
         self.build_dir
             .run(self.toolchain, self.krate, self.sandbox, self.patches, f)
+            .await
     }
 }
 
@@ -136,7 +138,7 @@ impl BuildDirectory {
         }
     }
 
-    pub(crate) fn run<R, F: FnOnce(&Build) -> Result<R, Error>>(
+    pub(crate) async fn run<R, F: FnOnce(&Build) -> Result<R, Error>>(
         &mut self,
         toolchain: &Toolchain,
         krate: &Crate,
@@ -150,9 +152,9 @@ impl BuildDirectory {
         }
 
         let mut prepare = Prepare::new(&self.workspace, toolchain, krate, &source_dir, patches);
-        prepare.prepare()?;
+        prepare.prepare().await?;
 
-        std::fs::create_dir_all(self.target_dir())?;
+        tokio::fs::create_dir_all(self.target_dir()).await?;
         let res = f(&Build {
             dir: self,
             toolchain,
@@ -169,6 +171,7 @@ impl BuildDirectory {
         if build_dir.exists() {
             remove_dir_all(build_dir)?;
         }
+
         Ok(())
     }
 

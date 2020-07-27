@@ -11,8 +11,6 @@ description = "Execute your code on the Rust ecosystem."
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [package.metadata.docs.rs]
 features = ["unstable"]
 
@@ -23,7 +21,7 @@ unstable = []
 failure = "0.1.3"
 futures-util = "0.3.5"
 log = "0.4.6"
-tokio = { version = "0.2.21", features = ["process", "time"] }
+tokio = { version = "0.2.22", features = ["process", "time", "fs", "macros"] }
 nix = "0.11.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -41,6 +39,7 @@ fs2 = "0.4.3"
 remove_dir_all = "0.5.2"
 base64 = "0.11.0"
 getrandom = { version = "0.1.12", features = ["std"] }
+async-trait = "0.1.36"
 
 [dev-dependencies]
 env_logger = "0.6.1"

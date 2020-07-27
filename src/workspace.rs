@@ -3,11 +3,13 @@ use crate::cmd::{Command, SandboxImage};
 use crate::inside_docker::CurrentContainer;
 use crate::Toolchain;
 use failure::{Error, ResultExt};
+use futures_util::stream::TryStreamExt;
 use log::info;
 use remove_dir_all::remove_dir_all;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::fs;
 
 #[cfg(windows)]
 static DEFAULT_SANDBOX_IMAGE: &str = "rustops/crates-build-env-windows";
@@ -135,53 +137,59 @@ impl WorkspaceBuilder {
 
     /// Initialize the workspace. This will create all the necessary local files and fetch the rest from the network. It's
     /// not unexpected for this method to take minutes to run on slower network connections.
-    pub fn init(self) -> Result<Workspace, Error> {
-        std::fs::create_dir_all(&self.path).with_context(|_| {
+    pub async fn init(self) -> Result<Workspace, Error> {
+        fs::create_dir_all(&self.path).await.with_context(|_| {
             format!(
                 "failed to create workspace directory: {}",
                 self.path.display()
             )
         })?;
 
-        crate::utils::file_lock(&self.path.join("lock"), "initialize the workspace", || {
-            let sandbox_image = if let Some(img) = self.sandbox_image {
-                img
-            } else {
-                SandboxImage::remote(DEFAULT_SANDBOX_IMAGE)?
-            };
+        crate::utils::file_lock(
+            &self.path.join("lock"),
+            "initialize the workspace",
+            async move {
+                let sandbox_image = if let Some(img) = self.sandbox_image {
+                    img
+                } else {
+                    SandboxImage::remote(DEFAULT_SANDBOX_IMAGE).await?
+                };
 
-            let mut headers = reqwest::header::HeaderMap::new();
-            headers.insert(reqwest::header::USER_AGENT, self.user_agent.parse()?);
-            let http = reqwest::blocking::ClientBuilder::new()
-                .default_headers(headers)
-                .build()?;
+                let mut headers = reqwest::header::HeaderMap::new();
+                headers.insert(reqwest::header::USER_AGENT, self.user_agent.parse()?);
+                let http = reqwest::ClientBuilder::new()
+                    .default_headers(headers)
+                    .build()?;
 
-            let mut ws = Workspace {
-                inner: Arc::new(WorkspaceInner {
-                    http,
-                    path: self.path,
-                    sandbox_image,
-                    command_timeout: self.command_timeout,
-                    command_no_output_timeout: self.command_no_output_timeout,
-                    fetch_registry_index_during_builds: self.fetch_registry_index_during_builds,
-                    current_container: None,
-                    rustup_profile: self.rustup_profile,
-                }),
-            };
+                let mut ws = Workspace {
+                    inner: Arc::new(WorkspaceInner {
+                        http,
+                        path: self.path,
+                        sandbox_image,
+                        command_timeout: self.command_timeout,
+                        command_no_output_timeout: self.command_no_output_timeout,
+                        fetch_registry_index_during_builds: self.fetch_registry_index_during_builds,
+                        current_container: None,
+                        rustup_profile: self.rustup_profile,
+                    }),
+                };
 
-            if self.running_inside_docker {
-                let container = CurrentContainer::detect(&ws)?;
-                Arc::get_mut(&mut ws.inner).unwrap().current_container = container;
-            }
+                if self.running_inside_docker {
+                    let container = CurrentContainer::detect(&ws).await?;
+                    Arc::get_mut(&mut ws.inner).unwrap().current_container = container;
+                }
 
-            ws.init(self.fast_init)?;
-            Ok(ws)
-        })
+                ws.init(self.fast_init).await?;
+
+                Ok(ws)
+            },
+        )
+        .await
     }
 }
 
 struct WorkspaceInner {
-    http: reqwest::blocking::Client,
+    http: reqwest::Client,
     path: PathBuf,
     sandbox_image: SandboxImage,
     command_timeout: Option<Duration>,
@@ -210,16 +218,17 @@ impl Workspace {
     }
 
     /// Remove all the contents of all the build directories, freeing disk space.
-    pub fn purge_all_build_dirs(&self) -> Result<(), Error> {
+    pub async fn purge_all_build_dirs(&self) -> Result<(), Error> {
         let dir = self.builds_dir();
         if dir.exists() {
             remove_dir_all(&dir)?;
         }
+
         Ok(())
     }
 
     /// Remove all the contents of the caches in the workspace, freeing disk space.
-    pub fn purge_all_caches(&self) -> Result<(), Error> {
+    pub async fn purge_all_caches(&self) -> Result<(), Error> {
         let mut paths = vec![
             self.cache_dir(),
             self.cargo_home().join("git"),
@@ -227,12 +236,15 @@ impl Workspace {
             self.cargo_home().join("registry").join("cache"),
         ];
 
-        for index in std::fs::read_dir(self.cargo_home().join("registry").join("index"))? {
-            let index = index?;
-            if index.file_type()?.is_dir() {
-                paths.push(index.path().join(".cache"));
-            }
-        }
+        fs::read_dir(self.cargo_home().join("registry").join("index"))
+            .await?
+            .try_for_each_concurrent(|index| async {
+                let index = index?;
+                if index.file_type()?.is_dir() {
+                    paths.push(index.path().join(".cache"));
+                }
+            })
+            .await?;
 
         for path in &paths {
             if path.exists() {
@@ -267,7 +279,7 @@ impl Workspace {
         crate::toolchain::list_installed_toolchains(&self.rustup_home())
     }
 
-    pub(crate) fn http_client(&self) -> &reqwest::blocking::Client {
+    pub(crate) fn http_client(&self) -> &reqwest::Client {
         &self.inner.http
     }
 
@@ -311,17 +323,19 @@ impl Workspace {
         &self.inner.rustup_profile
     }
 
-    fn init(&self, fast_init: bool) -> Result<(), Error> {
+    async fn init(&self, fast_init: bool) -> Result<(), Error> {
         info!("installing tools required by rustwide");
-        crate::tools::install(self, fast_init)?;
+        crate::tools::install(self, fast_init).await?;
+
         if !self.fetch_registry_index_during_builds() {
             info!("updating the local crates.io registry clone");
-            self.update_cratesio_registry()?;
+            self.update_cratesio_registry().await?;
         }
+
         Ok(())
     }
 
-    fn update_cratesio_registry(&self) -> Result<(), Error> {
+    async fn update_cratesio_registry(&self) -> Result<(), Error> {
         // This nop cargo command is to update the registry so we don't have to do it for each
         // crate.  using `install` is a temporary solution until
         // https://github.com/rust-lang/cargo/pull/5961 is ready
@@ -329,7 +343,8 @@ impl Workspace {
         let _ = Command::new(self, Toolchain::MAIN.cargo())
             .args(&["install", "lazy_static"])
             .no_output_timeout(None)
-            .run();
+            .run()
+            .await;
 
         // ignore the error untill https://github.com/rust-lang/cargo/pull/5961 is ready
         Ok(())

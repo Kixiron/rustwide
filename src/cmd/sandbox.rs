@@ -6,6 +6,7 @@ use serde::Deserialize;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tokio::fs;
 
 /// The Docker image used for sandboxing.
 pub struct SandboxImage {
@@ -16,10 +17,11 @@ impl SandboxImage {
     /// Load a local image present in the host machine.
     ///
     /// If the image is not available locally an error will be returned instead.
-    pub fn local(name: &str) -> Result<Self, Error> {
+    pub async fn local(name: &str) -> Result<Self, Error> {
         let image = SandboxImage { name: name.into() };
         info!("sandbox image is local, skipping pull");
-        image.ensure_exists_locally()?;
+        image.ensure_exists_locally().await?;
+
         Ok(image)
     }
 
@@ -27,30 +29,35 @@ impl SandboxImage {
     ///
     /// This will access the network to download the image from the registry. If pulling fails an
     /// error will be returned instead.
-    pub fn remote(name: &str) -> Result<Self, Error> {
+    pub async fn remote(name: &str) -> Result<Self, Error> {
         let mut image = SandboxImage { name: name.into() };
         info!("pulling image {} from Docker Hub", name);
         Command::new_workspaceless("docker")
             .args(&["pull", &name])
-            .run()?;
-        if let Some(name_with_hash) = image.get_name_with_hash() {
+            .run()
+            .await?;
+
+        if let Some(name_with_hash) = image.get_name_with_hash().await {
             image.name = name_with_hash;
             info!("pulled image {}", image.name);
         }
-        image.ensure_exists_locally()?;
+        image.ensure_exists_locally().await?;
+
         Ok(image)
     }
 
-    fn ensure_exists_locally(&self) -> Result<(), Error> {
+    async fn ensure_exists_locally(&self) -> Result<(), Error> {
         info!("checking the image {} is available locally", self.name);
         Command::new_workspaceless("docker")
             .args(&["image", "inspect", &self.name])
             .log_output(false)
-            .run()?;
+            .run()
+            .await?;
+
         Ok(())
     }
 
-    fn get_name_with_hash(&self) -> Option<String> {
+    async fn get_name_with_hash(&self) -> Option<String> {
         Command::new_workspaceless("docker")
             .args(&[
                 "inspect",
@@ -60,6 +67,7 @@ impl SandboxImage {
             ])
             .log_output(false)
             .run_capture()
+            .await
             .ok()?
             .stdout_lines()
             .first()
@@ -216,11 +224,11 @@ impl SandboxBuilder {
         self
     }
 
-    fn create(self, workspace: &Workspace) -> Result<Container<'_>, Error> {
+    async fn create(self, workspace: &Workspace) -> Result<Container<'_>, Error> {
         let mut args: Vec<String> = vec!["create".into()];
 
         for mount in &self.mounts {
-            std::fs::create_dir_all(&mount.host_path)?;
+            fs::create_dir_all(&mount.host_path).await?;
 
             // On Windows, we mount paths containing a colon which don't work with `-v`, but on
             // Linux we need the Z flag, which doesn't work with `--mount`, for SELinux relabeling.
@@ -270,7 +278,9 @@ impl SandboxBuilder {
 
         let out = Command::new(workspace, "docker")
             .args(&*args)
-            .run_capture()?;
+            .run_capture()
+            .await?;
+
         Ok(Container {
             id: out.stdout_lines()[0].clone(),
             workspace,
@@ -278,7 +288,7 @@ impl SandboxBuilder {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn run(
+    pub(super) async fn run(
         self,
         workspace: &Workspace,
         timeout: Option<Duration>,
@@ -288,7 +298,7 @@ impl SandboxBuilder {
         log_command: bool,
         capture: bool,
     ) -> Result<ProcessOutput, Error> {
-        let container = self.create(workspace)?;
+        let container = self.create(workspace).await?;
 
         // Ensure the container is properly deleted even if something panics
         scopeguard::defer! {{
@@ -301,14 +311,16 @@ impl SandboxBuilder {
             }
         }}
 
-        container.run(
-            timeout,
-            no_output_timeout,
-            process_lines,
-            log_output,
-            log_command,
-            capture,
-        )
+        container
+            .run(
+                timeout,
+                no_output_timeout,
+                process_lines,
+                log_output,
+                log_command,
+                capture,
+            )
+            .await
     }
 }
 
@@ -338,11 +350,12 @@ impl fmt::Display for Container<'_> {
 }
 
 impl Container<'_> {
-    fn inspect(&self) -> Result<InspectContainer, Error> {
+    async fn inspect(&self) -> Result<InspectContainer, Error> {
         let output = Command::new(self.workspace, "docker")
             .args(&["inspect", &self.id])
             .log_output(false)
-            .run_capture()?;
+            .run_capture()
+            .await?;
 
         let mut data: Vec<InspectContainer> =
             ::serde_json::from_str(&output.stdout_lines().join("\n"))?;
@@ -350,7 +363,7 @@ impl Container<'_> {
         Ok(data.pop().unwrap())
     }
 
-    fn run(
+    async fn run(
         &self,
         timeout: Option<Duration>,
         no_output_timeout: Option<Duration>,
@@ -370,8 +383,8 @@ impl Container<'_> {
             cmd = cmd.process_lines(f);
         }
 
-        let res = cmd.run_inner(capture);
-        let details = self.inspect()?;
+        let res = cmd.run_inner(capture).await;
+        let details = self.inspect().await?;
 
         // Return a different error if the container was killed due to an OOM
         if details.state.oom_killed {
@@ -385,10 +398,11 @@ impl Container<'_> {
         }
     }
 
-    fn delete(&self) -> Result<(), Error> {
+    async fn delete(&self) -> Result<(), Error> {
         Command::new(self.workspace, "docker")
             .args(&["rm", "-f", &self.id])
             .run()
+            .await
     }
 }
 
@@ -397,11 +411,12 @@ impl Container<'_> {
 /// The Docker daemon is required for sandboxing to work, and this function returns whether the
 /// daemon is online and reachable or not. Calling a sandboxed command when the daemon is offline
 /// will error too, but this function allows the caller to error earlier.
-pub fn docker_running(workspace: &Workspace) -> bool {
+pub async fn docker_running(workspace: &Workspace) -> bool {
     info!("checking if the docker daemon is running");
     Command::new(workspace, "docker")
         .args(&["info"])
         .log_output(false)
         .run()
+        .await
         .is_ok()
 }

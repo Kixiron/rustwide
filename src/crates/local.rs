@@ -1,5 +1,6 @@
 use super::CrateTrait;
 use crate::Workspace;
+use async_trait::async_trait;
 use failure::Error;
 use log::info;
 use std::path::{Path, PathBuf};
@@ -15,24 +16,26 @@ impl Local {
     }
 }
 
+#[async_trait]
 impl CrateTrait for Local {
-    fn fetch(&self, _workspace: &Workspace) -> Result<(), Error> {
+    async fn fetch(&self, _workspace: &Workspace) -> Result<(), Error> {
         // There is no fetch to do for a local crate.
         Ok(())
     }
 
-    fn purge_from_cache(&self, _workspace: &Workspace) -> Result<(), Error> {
+    async fn purge_from_cache(&self, _workspace: &Workspace) -> Result<(), Error> {
         // There is no cache to purge for a local crate.
         Ok(())
     }
 
-    fn copy_source_to(&self, _workspace: &Workspace, dest: &Path) -> Result<(), Error> {
+    async fn copy_source_to(&self, _workspace: &Workspace, dest: &Path) -> Result<(), Error> {
         info!(
             "copying local crate from {} to {}",
             self.path.display(),
             dest.display()
         );
-        copy_dir(&self.path, dest)?;
+        copy_dir(&self.path, dest).await?;
+
         Ok(())
     }
 }
@@ -43,7 +46,7 @@ impl std::fmt::Display for Local {
     }
 }
 
-fn copy_dir(src: &Path, dest: &Path) -> Result<(), Error> {
+async fn copy_dir(src: &Path, dest: &Path) -> Result<(), Error> {
     let src = crate::utils::normalize_path(src);
     let dest = crate::utils::normalize_path(dest);
 
@@ -76,62 +79,64 @@ fn copy_dir(src: &Path, dest: &Path) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use failure::Error;
+    use tokio::fs;
 
-    #[test]
-    fn test_copy_dir() -> Result<(), Error> {
+    #[tokio::test]
+    async fn test_copy_dir() -> Result<(), Error> {
         let tmp_src = tempfile::tempdir()?;
         let tmp_dest = tempfile::tempdir()?;
 
         // Create some files in the src dir
-        std::fs::create_dir(tmp_src.path().join("dir"))?;
-        std::fs::write(tmp_src.path().join("foo"), b"Hello world")?;
-        std::fs::write(tmp_src.path().join("dir").join("bar"), b"Rustwide")?;
+        fs::create_dir(tmp_src.path().join("dir")).await?;
+        fs::write(tmp_src.path().join("foo"), b"Hello world").await?;
+        fs::write(tmp_src.path().join("dir").join("bar"), b"Rustwide").await?;
 
-        super::copy_dir(tmp_src.path(), tmp_dest.path())?;
+        super::copy_dir(tmp_src.path(), tmp_dest.path()).await?;
 
-        assert_eq!(std::fs::read(tmp_dest.path().join("foo"))?, b"Hello world");
+        assert_eq!(fs::read(tmp_dest.path().join("foo")).await?, b"Hello world");
         assert_eq!(
-            std::fs::read(tmp_dest.path().join("dir").join("bar"))?,
+            fs::read(tmp_dest.path().join("dir").join("bar")).await?,
             b"Rustwide"
         );
 
         Ok(())
     }
 
-    #[test]
-    fn test_no_copy_target() -> Result<(), Error> {
+    #[tokio::test]
+    async fn test_no_copy_target() -> Result<(), Error> {
         let (src, dest) = (tempfile::tempdir()?, tempfile::tempdir()?);
-        std::fs::create_dir(src.path().join("target"))?;
-        std::fs::write(
+        fs::create_dir(src.path().join("target")).await?;
+        fs::write(
             src.path().join("target").join("a.out"),
             b"this is not actually an ELF file",
-        )?;
+        )
+        .await?;
         println!("made subdirs and files");
 
-        super::copy_dir(src.path(), dest.path())?;
+        super::copy_dir(src.path(), dest.path()).await?;
         println!("copied");
 
         assert!(!dest.path().join("target").exists());
         Ok(())
     }
 
-    #[test]
-    fn test_copy_symlinks() -> Result<(), Error> {
-        use std::{fs, os, path::Path};
+    #[tokio::test]
+    async fn test_copy_symlinks() -> Result<(), Error> {
+        use std::{os, path::Path};
 
         let tmp_src = tempfile::tempdir()?;
         let tmp_dest = tempfile::tempdir()?;
-        let assert_copy_err_has_filename = || {
-            match super::copy_dir(tmp_src.path(), tmp_dest.path()) {
+        let assert_copy_err_has_filename = async {
+            match super::copy_dir(tmp_src.path(), tmp_dest.path()).await {
                 Ok(_) => panic!("copy with bad symbolic link did not fail"),
                 Err(err) => assert!(err.downcast::<walkdir::Error>().unwrap().path().is_some()),
             };
         };
 
         // Create some files in the src dir
-        fs::create_dir(tmp_src.path().join("dir"))?;
-        fs::write(tmp_src.path().join("foo"), b"Hello world")?;
-        fs::write(tmp_src.path().join("dir").join("bar"), b"Rustwide")?;
+        fs::create_dir(tmp_src.path().join("dir")).await?;
+        fs::write(tmp_src.path().join("foo"), b"Hello world").await?;
+        fs::write(tmp_src.path().join("dir").join("bar"), b"Rustwide").await?;
         let bad_link = tmp_src.path().join("symlink");
 
         // test link to non-existent file
@@ -143,11 +148,11 @@ mod tests {
         panic!("testing symbolic links not supported except on windows and linux");
 
         println!("{} should cause copy to fail", bad_link.display());
-        assert_copy_err_has_filename();
+        assert_copy_err_has_filename.await;
 
-        fs::remove_file(&bad_link)?;
+        fs::remove_file(&bad_link).await?;
         // make sure it works without that link
-        super::copy_dir(tmp_src.path(), tmp_dest.path())?;
+        super::copy_dir(tmp_src.path(), tmp_dest.path()).await?;
 
         // test link to self
         #[cfg(unix)]
@@ -156,7 +161,7 @@ mod tests {
         os::windows::fs::symlink_file(&bad_link, &bad_link)?;
 
         println!("{} should cause copy to fail", bad_link.display());
-        assert_copy_err_has_filename();
+        assert_copy_err_has_filename.await;
         Ok(())
     }
 }

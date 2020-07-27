@@ -2,6 +2,7 @@ use super::CrateTrait;
 use crate::cmd::{Command, ProcessLinesActions};
 use crate::prepare::PrepareError;
 use crate::Workspace;
+use async_trait::async_trait;
 use failure::{Error, ResultExt};
 use log::{info, warn};
 use percent_encoding::{percent_encode, AsciiSet, CONTROLS};
@@ -28,11 +29,12 @@ impl GitRepo {
         Self { url: url.into() }
     }
 
-    pub(super) fn git_commit(&self, workspace: &Workspace) -> Option<String> {
+    pub(super) async fn git_commit(&self, workspace: &Workspace) -> Option<String> {
         let res = Command::new(workspace, "git")
             .args(&["rev-parse", "HEAD"])
             .cd(&self.cached_path(workspace))
-            .run_capture();
+            .run_capture()
+            .await;
 
         match res {
             Ok(out) => {
@@ -47,6 +49,7 @@ impl GitRepo {
                 warn!("unable to capture sha for {}: {}", self.url, e);
             }
         }
+
         None
     }
 
@@ -75,8 +78,9 @@ impl GitRepo {
     }
 }
 
+#[async_trait]
 impl CrateTrait for GitRepo {
-    fn fetch(&self, workspace: &Workspace) -> Result<(), Error> {
+    async fn fetch(&self, workspace: &Workspace) -> Result<(), Error> {
         // The credential helper that suppresses the password prompt shows this message when a
         // repository requires authentication:
         //
@@ -92,6 +96,7 @@ impl CrateTrait for GitRepo {
         let path = self.cached_path(workspace);
         let res = if path.join("HEAD").is_file() {
             info!("updating cached repository {}", self.url);
+
             Command::new(workspace, "git")
                 .args(&self.suppress_password_prompt_args(workspace))
                 .args(&["-c", "remote.origin.fetch=refs/heads/*:refs/heads/*"])
@@ -99,15 +104,18 @@ impl CrateTrait for GitRepo {
                 .cd(&path)
                 .process_lines(&mut detect_private_repositories)
                 .run()
+                .await
                 .with_context(|_| format!("failed to update {}", self.url))
         } else {
             info!("cloning repository {}", self.url);
+
             Command::new(workspace, "git")
                 .args(&self.suppress_password_prompt_args(workspace))
                 .args(&["clone", "--bare", &self.url])
                 .args(&[&path])
                 .process_lines(&mut detect_private_repositories)
                 .run()
+                .await
                 .with_context(|_| format!("failed to clone {}", self.url))
         };
 
@@ -123,15 +131,18 @@ impl CrateTrait for GitRepo {
         if path.exists() {
             remove_dir_all::remove_dir_all(&path)?;
         }
+
         Ok(())
     }
 
-    fn copy_source_to(&self, workspace: &Workspace, dest: &Path) -> Result<(), Error> {
+    async fn copy_source_to(&self, workspace: &Workspace, dest: &Path) -> Result<(), Error> {
         Command::new(workspace, "git")
             .args(&["clone"])
             .args(&[self.cached_path(workspace).as_path(), dest])
             .run()
+            .await
             .with_context(|_| format!("failed to checkout {}", self.url))?;
+
         Ok(())
     }
 }

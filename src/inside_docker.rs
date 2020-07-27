@@ -11,19 +11,22 @@ pub(crate) struct CurrentContainer {
 }
 
 impl CurrentContainer {
-    pub(crate) fn detect(workspace: &Workspace) -> Result<Option<Self>, Error> {
-        if let Some(id) = probe_container_id(workspace)? {
+    pub(crate) async fn detect(workspace: &Workspace) -> Result<Option<Self>, Error> {
+        if let Some(id) = probe_container_id(workspace).await? {
             info!("inspecting the current container");
             let inspect = Command::new(workspace, "docker")
                 .args(&["inspect", &id])
                 .log_output(false)
                 .log_command(false)
-                .run_capture()?;
+                .run_capture()
+                .await?;
+
             let content = inspect.stdout_lines().join("\n");
             let mut metadata: Vec<Metadata> = serde_json::from_str(&content)?;
             if metadata.len() != 1 {
                 failure::bail!("invalid output returned by `docker inspect`");
             }
+
             Ok(Some(CurrentContainer {
                 metadata: metadata.pop().unwrap(),
             }))
@@ -44,7 +47,7 @@ impl CurrentContainer {
 /// This function uses a simpler but slower method to get the ID: a file with a random string is
 /// created in the temp directory, the list of all the containers is fetched from Docker and then
 /// `cat` is executed inside each of them to check whether they have the same random string.
-pub(crate) fn probe_container_id(workspace: &Workspace) -> Result<Option<String>, Error> {
+pub(crate) async fn probe_container_id(workspace: &Workspace) -> Result<Option<String>, Error> {
     info!("detecting the ID of the container where rustwide is running");
 
     // Create the probe on the current file system
@@ -53,14 +56,16 @@ pub(crate) fn probe_container_id(workspace: &Workspace) -> Result<Option<String>
     let mut probe_content = [0u8; 64];
     getrandom(&mut probe_content)?;
     let probe_content = base64::encode(&probe_content[..]);
-    std::fs::write(&probe_path, probe_content.as_bytes())?;
+    tokio::fs::write(&probe_path, probe_content.as_bytes()).await?;
 
     // Check if the probe exists on any of the currently running containers.
     let out = Command::new(workspace, "docker")
         .args(&["ps", "--format", "{{.ID}}", "--no-trunc"])
         .log_output(false)
         .log_command(false)
-        .run_capture()?;
+        .run_capture()
+        .await?;
+
     for id in out.stdout_lines() {
         info!("probing container id {}", id);
 
@@ -68,7 +73,9 @@ pub(crate) fn probe_container_id(workspace: &Workspace) -> Result<Option<String>
             .args(&["exec", &id, "cat", probe_path_str])
             .log_output(false)
             .log_command(false)
-            .run_capture();
+            .run_capture()
+            .await;
+
         if let Ok(&[ref probed]) = res.as_ref().map(|out| out.stdout_lines()) {
             if *probed == probe_content {
                 info!("probe successful, this is container ID {}", id);

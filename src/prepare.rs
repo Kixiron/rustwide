@@ -2,8 +2,8 @@ use crate::cmd::Command;
 use crate::{build::CratePatch, Crate, Toolchain, Workspace};
 use failure::{Error, Fail, ResultExt};
 use log::info;
-use std::fs::remove_file;
 use std::path::Path;
+use tokio::fs;
 use toml::{
     value::{Array, Table},
     Value,
@@ -36,18 +36,20 @@ impl<'a> Prepare<'a> {
         }
     }
 
-    pub(crate) fn prepare(&mut self) -> Result<(), Error> {
-        self.krate.copy_source_to(self.workspace, self.source_dir)?;
-        self.validate_manifest()?;
-        self.remove_cargo_config()?;
-        self.tweak_toml()?;
-        self.capture_lockfile(false)?;
-        self.fetch_deps()?;
+    pub(crate) async fn prepare(&mut self) -> Result<(), Error> {
+        self.krate
+            .copy_source_to(self.workspace, self.source_dir)
+            .await?;
+        self.validate_manifest().await?;
+        self.remove_cargo_config().await?;
+        self.tweak_toml().await?;
+        self.capture_lockfile(false).await?;
+        self.fetch_deps().await?;
 
         Ok(())
     }
 
-    fn validate_manifest(&self) -> Result<(), Error> {
+    async fn validate_manifest(&self) -> Result<(), Error> {
         info!(
             "validating manifest of {} on toolchain {}",
             self.krate, self.toolchain
@@ -62,7 +64,8 @@ impl<'a> Prepare<'a> {
             .args(&["read-manifest", "--manifest-path", "Cargo.toml"])
             .cd(self.source_dir)
             .log_output(false)
-            .run();
+            .run()
+            .await;
         if res.is_err() {
             return Err(PrepareError::InvalidCargoTomlSyntax.into());
         }
@@ -70,29 +73,32 @@ impl<'a> Prepare<'a> {
         Ok(())
     }
 
-    fn remove_cargo_config(&self) -> Result<(), Error> {
+    async fn remove_cargo_config(&self) -> Result<(), Error> {
         let path = self.source_dir.join(".cargo").join("config");
         if path.exists() {
-            remove_file(path.clone())?;
+            tokio::fs::remove_file(path.clone()).await?;
             info!("removed {}", path.as_path().display());
         }
+
         Ok(())
     }
 
-    fn tweak_toml(&self) -> Result<(), Error> {
+    async fn tweak_toml(&self) -> Result<(), Error> {
         let path = self.source_dir.join("Cargo.toml");
-        let mut tweaker = TomlTweaker::new(&self.krate, &path, &self.patches)?;
+        let mut tweaker = TomlTweaker::new(&self.krate, &path, &self.patches).await?;
         tweaker.tweak();
-        tweaker.save(&path)?;
+        tweaker.save(&path).await?;
+
         Ok(())
     }
 
-    fn capture_lockfile(&mut self, force: bool) -> Result<(), Error> {
+    async fn capture_lockfile(&mut self, force: bool) -> Result<(), Error> {
         if !force && self.source_dir.join("Cargo.lock").exists() {
             info!(
                 "crate {} already has a lockfile, it will not be regenerated",
-                self.krate
+                self.krate,
             );
+
             return Ok(());
         }
 
@@ -102,11 +108,13 @@ impl<'a> Prepare<'a> {
             "--manifest-path",
             "Cargo.toml",
         ]);
+
         if !self.workspace.fetch_registry_index_during_builds() {
             cmd = cmd
                 .args(&["-Zno-index-update"])
                 .env("__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS", "nightly");
         }
+
         let res = cmd
             .cd(self.source_dir)
             .process_lines(&mut |line, _| {
@@ -114,7 +122,9 @@ impl<'a> Prepare<'a> {
                     yanked_deps = true;
                 }
             })
-            .run();
+            .run()
+            .await;
+
         match res {
             Err(_) if yanked_deps => {
                 return Err(PrepareError::YankedDependencies.into());
@@ -122,10 +132,11 @@ impl<'a> Prepare<'a> {
             other => other?,
         }
         self.lockfile_captured = true;
+
         Ok(())
     }
 
-    fn fetch_deps(&mut self) -> Result<(), Error> {
+    async fn fetch_deps(&mut self) -> Result<(), Error> {
         let mut outdated_lockfile = false;
         let res = Command::new(self.workspace, self.toolchain.cargo())
             .args(&["fetch", "--locked", "--manifest-path", "Cargo.toml"])
@@ -137,19 +148,20 @@ impl<'a> Prepare<'a> {
                     outdated_lockfile = true;
                 }
             })
-            .run();
+            .run()
+            .await;
+
         match res {
-            Ok(_) => {}
+            Ok(_) => Ok(()),
             Err(_) if outdated_lockfile && !self.lockfile_captured => {
                 info!("the lockfile is outdated, regenerating it");
                 // Force-update the lockfile and recursively call this function to fetch
                 // dependencies again.
-                self.capture_lockfile(true)?;
-                return self.fetch_deps();
+                self.capture_lockfile(true).await?;
+                self.fetch_deps().await
             }
-            err => return err,
+            err => err,
         }
-        Ok(())
     }
 }
 
@@ -161,12 +173,13 @@ struct TomlTweaker<'a> {
 }
 
 impl<'a> TomlTweaker<'a> {
-    pub fn new(
+    pub async fn new(
         krate: &'a Crate,
         cargo_toml: &'a Path,
         patches: &[CratePatch],
     ) -> Result<Self, Error> {
-        let toml_content = ::std::fs::read_to_string(cargo_toml)
+        let toml_content = fs::read_to_string(cargo_toml)
+            .await
             .with_context(|_| PrepareError::MissingCargoToml)?;
         let table: Table =
             toml::from_str(&toml_content).with_context(|_| PrepareError::InvalidCargoTomlSyntax)?;
@@ -191,7 +204,7 @@ impl<'a> TomlTweaker<'a> {
         }
     }
 
-    pub fn tweak(&mut self) {
+    fn tweak(&mut self) {
         info!("started tweaking {}", self.krate);
 
         self.remove_missing_items("example");
@@ -205,7 +218,7 @@ impl<'a> TomlTweaker<'a> {
     }
 
     #[allow(clippy::ptr_arg)]
-    fn test_existance(dir: &Path, value: &Array, folder: &str) -> Array {
+    fn test_existence(dir: &Path, value: &Array, folder: &str) -> Array {
         value
             .iter()
             .filter_map(|t| t.as_table())
@@ -231,7 +244,7 @@ impl<'a> TomlTweaker<'a> {
         if let Some(dir) = self.dir {
             if let Some(&mut Value::Array(ref mut array)) = self.table.get_mut(category) {
                 let dim = array.len();
-                *(array) = Self::test_existance(dir, array, folder);
+                *(array) = Self::test_existence(dir, array, folder);
                 info!("removed {} missing {}", dim - array.len(), folder);
             }
         }
@@ -358,9 +371,10 @@ impl<'a> TomlTweaker<'a> {
         }
     }
 
-    pub fn save(self, output_file: &Path) -> Result<(), Error> {
+    pub async fn save(self, output_file: &Path) -> Result<(), Error> {
         let crate_name = self.krate.to_string();
-        ::std::fs::write(output_file, Value::Table(self.table).to_string().as_bytes())?;
+        fs::write(output_file, Value::Table(self.table).to_string().as_bytes()).await?;
+
         info!(
             "tweaked toml for {} written to {}",
             crate_name,

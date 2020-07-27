@@ -1,13 +1,17 @@
 use super::CrateTrait;
 use crate::Workspace;
+use async_trait::async_trait;
 use failure::Error;
 use flate2::read::GzDecoder;
 use log::info;
 use remove_dir_all::remove_dir_all;
-use std::fs::File;
-use std::io::{BufReader, BufWriter, Read};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use tar::Archive;
+use tokio::{
+    fs::{self, File},
+    io::{BufReader, BufWriter},
+};
 
 static CRATES_ROOT: &str = "https://static.crates.io/crates";
 
@@ -33,8 +37,9 @@ pub(super) struct CratesIOCrate {
     version: String,
 }
 
+#[async_trait]
 impl CrateTrait for CratesIOCrate {
-    fn fetch(&self, workspace: &Workspace) -> Result<(), Error> {
+    async fn fetch(&self, workspace: &Workspace) -> Result<(), Error> {
         let local = self.cache_path(workspace);
         if local.exists() {
             info!("crate {} {} is already in cache", self.name, self.version);
@@ -43,7 +48,7 @@ impl CrateTrait for CratesIOCrate {
 
         info!("fetching crate {} {}...", self.name, self.version);
         if let Some(parent) = local.parent() {
-            std::fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent).await?;
         }
         let remote = format!(
             "{0}/{1}/{1}-{2}.crate",
@@ -52,24 +57,27 @@ impl CrateTrait for CratesIOCrate {
         let mut resp = workspace
             .http_client()
             .get(&remote)
-            .send()?
+            .send()
+            .await?
             .error_for_status()?;
-        resp.copy_to(&mut BufWriter::new(File::create(&local)?))?;
+        resp.copy_to(&mut BufWriter::new(File::create(&local).await?))
+            .await?;
 
         Ok(())
     }
 
-    fn purge_from_cache(&self, workspace: &Workspace) -> Result<(), Error> {
+    async fn purge_from_cache(&self, workspace: &Workspace) -> Result<(), Error> {
         let path = self.cache_path(workspace);
         if path.exists() {
-            std::fs::remove_file(&path)?;
+            fs::remove_file(&path).await?;
         }
+
         Ok(())
     }
 
-    fn copy_source_to(&self, workspace: &Workspace, dest: &Path) -> Result<(), Error> {
+    async fn copy_source_to(&self, workspace: &Workspace, dest: &Path) -> Result<(), Error> {
         let cached = self.cache_path(workspace);
-        let mut file = File::open(cached)?;
+        let mut file = File::open(cached).await?;
         let mut tar = Archive::new(GzDecoder::new(BufReader::new(&mut file)));
 
         info!(

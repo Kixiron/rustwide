@@ -1,35 +1,48 @@
 use failure::Error;
 use fs2::FileExt;
+use futures_util::future::FutureExt;
 use log::warn;
-use std::fs::OpenOptions;
-use std::path::{Component, Path, PathBuf, Prefix, PrefixComponent};
+use std::{
+    fs::OpenOptions,
+    future::Future,
+    panic,
+    path::{Component, Path, PathBuf, Prefix, PrefixComponent},
+};
+use tokio::task;
 
-pub(crate) fn file_lock<T>(
+pub(crate) async fn file_lock<T>(
     path: &Path,
     msg: &str,
-    f: impl FnOnce() -> Result<T, Error> + std::panic::UnwindSafe,
+    f: impl Future<Output = Result<T, Error>> + panic::UnwindSafe + Send + 'static,
 ) -> Result<T, Error> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(path)?;
+    let (path, msg) = (path.to_owned(), msg.to_owned());
+    let file = task::spawn_blocking(move || {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(path)?;
 
-    let mut message_displayed = false;
-    while let Err(err) = file.try_lock_exclusive() {
-        if !message_displayed && err.kind() == fs2::lock_contended_error().kind() {
-            warn!("blocking on other processes finishing to {}", msg);
-            message_displayed = true;
+        let mut message_displayed = false;
+        while let Err(err) = file.try_lock_exclusive() {
+            if !message_displayed && err.kind() == fs2::lock_contended_error().kind() {
+                warn!("blocking on other processes finishing to {}", msg);
+                message_displayed = true;
+            }
+
+            file.lock_exclusive()?;
         }
-        file.lock_exclusive()?;
-    }
 
-    let res = std::panic::catch_unwind(f);
-    let _ = file.unlock();
+        Result::<_, Error>::Ok(file)
+    })
+    .await??;
+
+    let res = f.catch_unwind().await;
+    let _ = task::spawn_blocking(move || file.unlock()).await?;
 
     match res {
         Ok(res) => res,
-        Err(panic) => std::panic::resume_unwind(panic),
+        Err(panic) => panic::resume_unwind(panic),
     }
 }
 

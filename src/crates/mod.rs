@@ -3,15 +3,17 @@ mod git;
 mod local;
 
 use crate::Workspace;
+use async_trait::async_trait;
 use failure::Error;
 use log::info;
 use remove_dir_all::remove_dir_all;
 use std::path::Path;
 
+#[async_trait]
 trait CrateTrait: std::fmt::Display {
-    fn fetch(&self, workspace: &Workspace) -> Result<(), Error>;
-    fn purge_from_cache(&self, workspace: &Workspace) -> Result<(), Error>;
-    fn copy_source_to(&self, workspace: &Workspace, dest: &Path) -> Result<(), Error>;
+    async fn fetch(&self, workspace: &Workspace) -> Result<(), Error>;
+    async fn purge_from_cache(&self, workspace: &Workspace) -> Result<(), Error>;
+    async fn copy_source_to(&self, workspace: &Workspace, dest: &Path) -> Result<(), Error>;
 }
 
 enum CrateType {
@@ -44,26 +46,30 @@ impl Crate {
 
     /// Fetch the crate's source code and cache it in the workspace. This method will reach out to
     /// the network for some crate types.
-    pub fn fetch(&self, workspace: &Workspace) -> Result<(), Error> {
-        self.as_trait().fetch(workspace)
+    pub async fn fetch(&self, workspace: &Workspace) -> Result<(), Error> {
+        self.as_trait().fetch(workspace).await
     }
 
     /// Remove the cached copy of this crate. The method will do nothing if the crate isn't cached.
-    pub fn purge_from_cache(&self, workspace: &Workspace) -> Result<(), Error> {
-        self.as_trait().purge_from_cache(workspace)
+    pub async fn purge_from_cache(&self, workspace: &Workspace) -> Result<(), Error> {
+        self.as_trait().purge_from_cache(workspace).await
     }
 
     /// Get this crate's git commit. This method is best-effort, and currently works just for git
     /// crates. If the commit can't be retrieved `None` will be returned.
-    pub fn git_commit(&self, workspace: &Workspace) -> Option<String> {
+    pub async fn git_commit(&self, workspace: &Workspace) -> Option<String> {
         if let CrateType::Git(repo) = &self.0 {
-            repo.git_commit(workspace)
+            repo.git_commit(workspace).await
         } else {
             None
         }
     }
 
-    pub(crate) fn copy_source_to(&self, workspace: &Workspace, dest: &Path) -> Result<(), Error> {
+    pub(crate) async fn copy_source_to(
+        &self,
+        workspace: &Workspace,
+        dest: &Path,
+    ) -> Result<(), Error> {
         if dest.exists() {
             info!(
                 "crate source directory {} already exists, cleaning it up",
@@ -71,7 +77,8 @@ impl Crate {
             );
             remove_dir_all(dest)?;
         }
-        self.as_trait().copy_source_to(workspace, dest)
+
+        self.as_trait().copy_source_to(workspace, dest).await
     }
 
     fn as_trait(&self) -> &dyn CrateTrait {
